@@ -1,0 +1,237 @@
+# ==============================================================================
+# OBSERVE BY SNOWFLAKE - GITHUB ACTIONS CI/CD PIPELINE
+# Enterprise Observability Platform Deployment Automation
+# ==============================================================================
+
+name: Observability Platform CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'sql/**'
+      - 'python/**'
+      - 'streamlit/**'
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+  SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+
+jobs:
+  # ============================================================================
+  # VALIDATION
+  # ============================================================================
+  validate:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install sqlfluff snowflake-connector-python snowflake-snowpark-python
+          pip install ruff mypy pytest
+
+      - name: Lint SQL
+        run: sqlfluff lint sql/ --dialect snowflake
+
+      - name: Lint Python
+        run: ruff check python/ streamlit/
+
+      - name: Type Check
+        run: mypy python/ --ignore-missing-imports
+
+      - name: Validate Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init & Validate
+        working-directory: terraform/
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  # ============================================================================
+  # SECURITY SCANNING
+  # ============================================================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret Detection
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
+
+      - name: SAST Scan
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: python
+
+      - name: Terraform Security
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+
+  # ============================================================================
+  # TEST
+  # ============================================================================
+  test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [validate, security]
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run SQL compilation tests
+        run: |
+          python tests/test_sql_compilation.py
+
+      - name: Run Snowpark unit tests
+        run: pytest tests/test_snowpark/ -v --tb=short
+
+      - name: Run integration tests
+        run: pytest tests/test_integration/ -v --tb=short
+        env:
+          TEST_DATABASE: OBSERVABILITY_PLATFORM_DEV
+
+  # ============================================================================
+  # DEPLOY INFRASTRUCTURE
+  # ============================================================================
+  deploy-infra:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Plan
+        working-directory: terraform/
+        run: |
+          terraform init
+          terraform plan -out=tfplan -var="environment=prod"
+
+      - name: Terraform Apply
+        working-directory: terraform/
+        run: terraform apply -auto-approve tfplan
+
+  # ============================================================================
+  # DEPLOY SQL OBJECTS
+  # ============================================================================
+  deploy-sql:
+    name: Deploy SQL Objects
+    runs-on: ubuntu-latest
+    needs: deploy-infra
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Snowflake CLI
+        run: pip install snowflake-cli-labs
+
+      - name: Deploy DDLs
+        run: |
+          snow sql -f sql/01_foundation.sql
+          snow sql -f sql/02_raw_tables.sql
+          snow sql -f sql/03_dynamic_tables.sql
+          snow sql -f sql/04_ai_sre.sql
+          snow sql -f sql/05_alerting.sql
+          snow sql -f sql/06_governance.sql
+
+      - name: Verify deployment
+        run: |
+          snow sql -q "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = 'OBSERVABILITY_PLATFORM'"
+
+  # ============================================================================
+  # DEPLOY STREAMLIT
+  # ============================================================================
+  deploy-streamlit:
+    name: Deploy Streamlit App
+    runs-on: ubuntu-latest
+    needs: deploy-sql
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Snowflake CLI
+        run: pip install snowflake-cli-labs
+
+      - name: Deploy Streamlit
+        run: |
+          snow streamlit deploy observability-command-center \
+            --file streamlit/observability_dashboard.py \
+            --open-url=false
+
+  # ============================================================================
+  # POST-DEPLOYMENT VALIDATION
+  # ============================================================================
+  validate-deployment:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-sql, deploy-streamlit]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python
+
+      - name: Run deployment validation
+        run: python tests/validate_deployment.py
+        env:
+          VALIDATION_ENV: production
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "Deployment successful at $(date)"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "::error::Deployment validation failed"
