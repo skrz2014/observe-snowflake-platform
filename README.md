@@ -57,6 +57,7 @@ The platform is designed using a **Medallion Architecture** approach with Snowfl
 └────────────────────────────────────────────────────────────┘
 ```
 
+
 ---
 
 # 📁 Repository Structure
@@ -433,12 +434,7 @@ Licensed under the Apache 2.0 License.
 
 ---
 
-# 🙏 Acknowledgments
-
-- Snowflake
-- Streamlit
-- OpenTelemetry Community
-- Snowflake Cortex AI
+https://www.youtube.com/watch?v=vwOciuDkFe8
 
 ---
 
